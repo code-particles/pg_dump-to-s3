@@ -4,61 +4,82 @@ Automatically dump and archive PostgreSQL backups to Amazon S3.
 
 ## Requirements
 
-- [AWS CLI](https://aws.amazon.com/cli)
-- `python3` (used for cross-platform date handling)
-- `pg_dump`, `pg_restore`, and `psql` available in `PATH`
+- `python3` (portable retention and listing helpers)
+- [AWS CLI](https://aws.amazon.com/cli) – can be installed via pip: `pip install -r requirements.txt`
+- PostgreSQL client tools in PATH: `pg_dump`, `pg_restore`, `psql`
 
 ## Setup
 
+- (Python deps) From the repo root, install Python-level dependencies:
+
+  ```bash
+  python3 -m pip install --user -r requirements.txt
+  ```
+
 - Use `aws configure` to store your AWS credentials in `~/.aws` ([docs](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html#cli-quick-configuration))
-- Copy `.conf` to either the project root or `~/.pg_dump-to-s3.conf` and update the values.
-- If your PostgreSQL connection uses a password, store it securely in `~/.pgpass` ([docs](https://www.postgresql.org/docs/current/static/libpq-pgpass.html)).
+- Copy `.conf` to either the project root or `~/.pg_dump-to-s3.conf` and update the values. `.env` in the project root is also sourced (handy for container/CI).
+- If your PostgreSQL connection uses a password, store it in `~/.pgpass` ([docs](https://www.postgresql.org/docs/current/static/libpq-pgpass.html)) or export `PGPASSWORD` securely.
+- Ensure the S3 bucket/prefix exists and your credentials have `s3:GetObject`, `PutObject`, `DeleteObject`, and `ListBucket` on that prefix. If using SSE-KMS, grant `kms:Encrypt`, `kms:Decrypt`, and `kms:GenerateDataKey`.
 
 ### Configuration keys (`.conf`)
 
-| Key | Description | Default |
-| --- | --- | --- |
-| `PG_HOST` | PostgreSQL host | _required_ |
-| `PG_USER` | PostgreSQL user | _required_ |
-| `PG_PORT` | PostgreSQL port | _required_ |
-| `PG_DATABASES` | Comma-separated list of databases to back up | _required_ |
-| `S3_PATH` | Bucket and prefix (e.g. `my-bucket/backups`) | _required_ |
-| `DELETE_AFTER` | Retention window in days (e.g. `7` or `7 days`) | _required_ |
-| `STORAGE_CLASS` | S3 storage class for uploads | `STANDARD_IA` |
-| `PG_DUMP_COMPRESSION` | `pg_dump` compression level `0-9` | `0` |
-| `S3_SSE` | Optional S3 server-side encryption (`AES256` or `aws:kms`) | _unset_ |
-| `S3_SSE_KMS_KEY_ID` | KMS key ID when `S3_SSE=aws:kms` | _unset_ |
-| `TMPDIR` | Temp directory for dump files | `/tmp` |
+| Key                    | Description                                    | Default                    |
+| ---------------------- | ---------------------------------------------- | -------------------------- |
+| `PG_HOST`              | PostgreSQL host                                | _required_                 |
+| `PG_USER`              | PostgreSQL user                                | _required_                 |
+| `PG_PORT`              | PostgreSQL port                                | _required_                 |
+| `PG_DATABASES`         | Comma-separated databases to back up           | _required_                 |
+| `PG_DATABASES_EXCLUDE` | Comma-separated names to skip                  | _unset_                    |
+| `S3_PATH`              | Legacy bucket/prefix (`bucket/path`)           | _required if no S3_BUCKET_ |
+| `S3_BUCKET`            | Bucket name (preferred)                        | _required if no S3_PATH_   |
+| `S3_PREFIX`            | Optional prefix inside bucket                  | _unset_                    |
+| `DELETE_AFTER`         | Retention in days (e.g. `7` or `7 days`)       | _required_                 |
+| `STORAGE_CLASS`        | S3 storage class                               | `STANDARD_IA`              |
+| `PG_DUMP_COMPRESSION`  | `pg_dump` compression level `0-9`              | `0`                        |
+| `S3_SSE`               | Server-side encryption (`AES256` or `aws:kms`) | _unset_                    |
+| `S3_SSE_KMS_KEY_ID`    | KMS key ID when `S3_SSE=aws:kms`               | _unset_                    |
+| `RETRY_ATTEMPTS`       | Retry attempts for AWS calls                   | `3`                        |
+| `RETRY_BASE_SLEEP`     | Backoff base seconds                           | `2`                        |
+| `MIN_FREE_MB`          | Minimum free space in `TMPDIR`                 | `512`                      |
+| `QUIET`                | Set `1` for quieter output (cron-friendly)     | `0`                        |
+| `DRY_RUN`              | Set `1` to print actions only                  | `0`                        |
+| `HEALTHCHECK_CMD`      | Optional command executed after success        | _unset_                    |
+| `TMPDIR`               | Temp directory for dump files                  | `/tmp`                     |
 
 ## Usage
 
 ```bash
 ./pg_dump-to-s3.sh
 
-#  * Backup in progress.,.
+#  * Backup in progress...
 #    -> backing up test...
-# upload: ../../../tmp/2023-06-28-at-22-20-08_test.dump to s3://*****/backups/2023-06-28-at-22-20-08_test.dump
-#       ...database test has been backed up
+# upload: ... to s3://bucket/prefix/...
 #  * Deleting old backups...
 
 # ...done!
 ```
 
 Notes:
-- Retention is computed with `python3`, so it works on macOS and Linux.
-- The bucket/prefix must already exist and your AWS credentials need permission to `s3:GetObject`, `PutObject`, `DeleteObject`, and `ListBucket` on that prefix.
-- Server-side encryption and storage class can be overridden via config (see above).
+
+- Retention is portable (python-based) and validated; works on macOS/Linux.
+- Uploads include checksum metadata and a `.sha256` sidecar; SSE/KMS and storage class are configurable.
+- Use `PG_DATABASES_EXCLUDE` to skip specific DBs from the backup list.
+- `DRY_RUN=1` prints actions without touching S3 or Postgres.
+- `HEALTHCHECK_CMD` can ping your monitoring endpoint after success.
 
 ## Restore a backup
 
 ```bash
-# USAGE: pg_restore-from-s3.sh [db target] [s3 object]
+# USAGE: pg_restore-from-s3.sh [options] <db target> <s3 object>
+#        pg_restore-from-s3.sh --latest <db target>
+#        pg_restore-from-s3.sh --list [prefix]
 
 ./pg_restore-from-s3.sh my_database_1 2023-06-28-at-10-29-44_my_database_1.dump
-
-# download: s3://your_bucket/folder/2023-06-28-at-22-17-15_my_database_1.dump to /tmp/2023-06-28-at-22-17-15_my_database_1.dump
-# Database my_database_1 already exists, skipping creation
-# 2023-06-28-at-22-17-15_my_database_1.dump restored to database my_database_1
 ```
 
-Restores will create the target database if it does not exist. Keep your `.conf` (or `~/.pg_dump-to-s3.conf`) in sync with the Postgres connection details used for backup.
+Restore extras:
+
+- `--latest` auto-picks the newest backup for the database.
+- `--list` shows available backups (optionally filtered by prefix) and exits.
+- `DRY_RUN=1` prints actions without downloading/restoring.
+- `HEALTHCHECK_CMD` can be used here as well.
