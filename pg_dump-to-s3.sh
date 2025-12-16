@@ -50,7 +50,12 @@ fail() {
 command -v python3 >/dev/null 2>&1 || fail "python3 is required for portable retention handling."
 command -v aws >/dev/null 2>&1 || fail "aws cli not found in PATH."
 PG_DUMP_BIN="${PG_DUMP_BIN:-pg_dump}"
-command -v "$PG_DUMP_BIN" >/dev/null 2>&1 || fail "pg_dump not found (set PG_DUMP_BIN to override)."
+# Allow compound commands (e.g., 'docker exec ... pg_dump') by skipping command -v when spaces are present
+if [[ "$PG_DUMP_BIN" =~ \  ]]; then
+    command -v docker >/dev/null 2>&1 || fail "docker not found in PATH for PG_DUMP_BIN override."
+else
+    command -v "$PG_DUMP_BIN" >/dev/null 2>&1 || fail "pg_dump not found (set PG_DUMP_BIN to override)."
+fi
 command -v shasum >/dev/null 2>&1 || fail "shasum (sha256) not found in PATH."
 
 REQUIRED_VARS=(PG_HOST PG_USER PG_PORT PG_DATABASES DELETE_AFTER)
@@ -167,7 +172,11 @@ for db in "${DBS[@]}"; do
         log "      DRY RUN: ${PG_DUMP_BIN} -Fc -Z ${PG_DUMP_COMPRESSION} -h ${PG_HOST} -U ${PG_USER} -p ${PG_PORT} ${db} > ${BACKUP_FILE}"
         log "      DRY RUN: aws s3 cp ${BACKUP_FILE} ${S3_URI}/${FILENAME}.dump"
     else
-        "$PG_DUMP_BIN" -Fc -Z "$PG_DUMP_COMPRESSION" -h "$PG_HOST" -U "$PG_USER" -p "$PG_PORT" "$db" > "$BACKUP_FILE"
+        if [[ "$PG_DUMP_BIN" =~ \  ]]; then
+            bash -c "$PG_DUMP_BIN -Fc -Z \"$PG_DUMP_COMPRESSION\" -h \"$PG_HOST\" -U \"$PG_USER\" -p \"$PG_PORT\" \"$db\" > \"$BACKUP_FILE\""
+        else
+            "$PG_DUMP_BIN" -Fc -Z "$PG_DUMP_COMPRESSION" -h "$PG_HOST" -U "$PG_USER" -p "$PG_PORT" "$db" > "$BACKUP_FILE"
+        fi
 
         CHECKSUM=$(shasum -a 256 "$BACKUP_FILE" | awk '{print $1}')
         echo "${CHECKSUM}  ${FILENAME}.dump" > "$CHECKSUM_FILE"
@@ -177,6 +186,7 @@ for db in "${DBS[@]}"; do
         if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
             AWS_CP_ARGS+=(--endpoint-url "$AWS_ENDPOINT_URL")
         fi
+        [ -n "${STORAGE_CLASS:-}" ] && AWS_CP_ARGS+=(--storage-class "$STORAGE_CLASS")
         [ -n "${S3_SSE:-}" ] && AWS_CP_ARGS+=(--sse "$S3_SSE")
         [ -n "${S3_SSE_KMS_KEY_ID:-}" ] && AWS_CP_ARGS+=(--sse-kms-key-id "$S3_SSE_KMS_KEY_ID")
         AWS_CP_ARGS+=(--metadata "sha256=${CHECKSUM}")
@@ -187,7 +197,11 @@ for db in "${DBS[@]}"; do
         retry aws s3 cp "$BACKUP_FILE" "s3://${S3_BUCKET_NAME}/${S3_KEY}" "${AWS_CP_ARGS[@]}"
         retry aws s3 cp "$CHECKSUM_FILE" "s3://${S3_BUCKET_NAME}/${S3_KEY_SHA}" "${AWS_CP_ARGS[@]}"
 
-        META_SHA=$(retry aws s3api head-object --bucket "$S3_BUCKET_NAME" --key "$S3_KEY" --query 'Metadata.sha256' --output text)
+        if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
+            META_SHA=$(retry aws s3api head-object --bucket "$S3_BUCKET_NAME" --key "$S3_KEY" --query 'Metadata.sha256' --output text --endpoint-url "$AWS_ENDPOINT_URL")
+        else
+            META_SHA=$(retry aws s3api head-object --bucket "$S3_BUCKET_NAME" --key "$S3_KEY" --query 'Metadata.sha256' --output text)
+        fi
         if [ "$META_SHA" != "$CHECKSUM" ]; then
             fail "Checksum metadata mismatch for ${FILENAME}.dump (expected ${CHECKSUM}, got ${META_SHA})."
         fi
@@ -200,7 +214,11 @@ if [ "$DRY_RUN" = "1" ]; then
     log " * Skipping deletion of old backups (DRY_RUN=1)"
 else
     log " * Deleting old backups..."
-    aws s3 ls "${S3_URI}/" | while read -r line; do
+    if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
+        aws s3 ls "${S3_URI}/" --endpoint-url "$AWS_ENDPOINT_URL"
+    else
+        aws s3 ls "${S3_URI}/"
+    fi | while read -r line; do
         [ -z "$line" ] && continue
         FILENAME=$(echo "$line" | awk '{print $4}')
         [ -z "$FILENAME" ] && continue
@@ -221,7 +239,11 @@ PY
 
         if [ "$FILE_TS" -lt "$RETENTION_THRESHOLD_TS" ]; then
             log "   -> Deleting $FILENAME"
-            aws s3 rm "${S3_URI}/${FILENAME}"
+            if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
+                aws s3 rm "${S3_URI}/${FILENAME}" --endpoint-url "$AWS_ENDPOINT_URL"
+            else
+                aws s3 rm "${S3_URI}/${FILENAME}"
+            fi
         fi
     done
 fi
@@ -234,4 +256,3 @@ fi
 log ""
 log "...done!"
 log ""
-

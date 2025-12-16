@@ -21,6 +21,34 @@ Automatically dump and archive PostgreSQL backups to Amazon S3.
 - If your PostgreSQL connection uses a password, store it in `~/.pgpass` ([docs](https://www.postgresql.org/docs/current/static/libpq-pgpass.html)) or export `PGPASSWORD` securely.
 - Ensure the S3 bucket/prefix exists and your credentials have `s3:GetObject`, `PutObject`, `DeleteObject`, and `ListBucket` on that prefix. If using SSE-KMS, grant `kms:Encrypt`, `kms:Decrypt`, and `kms:GenerateDataKey`.
 
+### Local testing (Postgres + MinIO)
+
+This repo includes a simple local harness to validate backups and restores end-to-end without touching real AWS:
+
+- Start services:
+  ```bash
+  cd tests
+  docker compose up -d
+  ```
+- From the repo root, use the provided `.conf` and `.env` (already tailored for the harness). The `.env` exports MinIO credentials and endpoint, and routes `pg_dump`/`pg_restore` through the Postgres container to avoid client/server version mismatches.
+- Run a backup:
+  ```bash
+  ./pg_dump-to-s3.sh
+  ```
+- Verify the uploaded objects:
+  ```bash
+  AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_DEFAULT_REGION=us-east-1 \
+    aws s3 ls s3://pg-backups/ --endpoint-url http://localhost:9000
+  ```
+- Restore the latest backup into a new database:
+  ```bash
+  ./pg_restore-from-s3.sh --latest restore_test
+  ```
+
+Notes:
+- When using custom S3-compatible endpoints, the scripts honor `AWS_ENDPOINT_URL` for all S3 operations.
+- To stream restore data into the container, `.env` sets `PG_RESTORE_BIN='docker exec -i tests-postgres-1 pg_restore'`. This avoids mapping host temp files into the container.
+
 ### Configuration keys (`.conf`)
 
 | Key                    | Description                                    | Default                    |

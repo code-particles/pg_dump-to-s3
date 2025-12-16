@@ -56,7 +56,11 @@ fail() {
 
 command -v aws >/dev/null 2>&1 || fail "aws cli not found in PATH."
 PG_RESTORE_BIN="${PG_RESTORE_BIN:-pg_restore}"
-command -v "$PG_RESTORE_BIN" >/dev/null 2>&1 || fail "pg_restore not found (set PG_RESTORE_BIN to override)."
+if [[ "$PG_RESTORE_BIN" =~ \  ]]; then
+    command -v docker >/dev/null 2>&1 || fail "docker not found in PATH for PG_RESTORE_BIN override."
+else
+    command -v "$PG_RESTORE_BIN" >/dev/null 2>&1 || fail "pg_restore not found (set PG_RESTORE_BIN to override)."
+fi
 command -v psql >/dev/null 2>&1 || fail "psql not found in PATH."
 command -v python3 >/dev/null 2>&1 || fail "python3 is required for latest backup selection."
 
@@ -174,31 +178,12 @@ retry() {
 }
 
 select_latest_object() {
-    # For simplicity in the test harness, just pick the latest .dump file by name
+    # Pick the latest .dump file by name using bash tools
+    local list_cmd=("aws" "s3" "ls" "${S3_URI}/")
     if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
-        aws s3 ls "${S3_URI}/" --endpoint-url "$AWS_ENDPOINT_URL"
-    else
-        aws s3 ls "${S3_URI}/"
-    fi | python3 - <<'PY'
-import sys
-
-lines = sys.stdin.read().strip().splitlines()
-matches = []
-for line in lines:
-    parts = line.split()
-    if len(parts) < 4:
-        continue
-    fname = parts[3]
-    if not fname.endswith(".dump"):
-        continue
-    matches.append(fname)
-
-if not matches:
-    sys.exit(1)
-
-matches.sort()
-print(matches[-1])
-PY
+        list_cmd+=("--endpoint-url" "$AWS_ENDPOINT_URL")
+    fi
+    "${list_cmd[@]}" | awk '{print $4}' | grep -E '\.dump$' | sort | tail -n 1
 }
 
 if [ "$USE_LATEST" -eq 1 ]; then
@@ -230,11 +215,23 @@ fi
 DB_EXISTS=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${TARGET_DB}'")
 if [ "$DB_EXISTS" = "1" ]; then
     log "Database ${TARGET_DB} already exists, skipping creation"
-    [ "$DRY_RUN" = "1" ] || "$PG_RESTORE_BIN" -h "$PG_HOST" -U "$PG_USER" -p "$PG_PORT" -d "$TARGET_DB" -Fc --clean "$LOCAL_BACKUP"
+    if [ "$DRY_RUN" != "1" ]; then
+        if [[ "$PG_RESTORE_BIN" =~ \  ]]; then
+            bash -c "$PG_RESTORE_BIN -h \"$PG_HOST\" -U \"$PG_USER\" -p \"$PG_PORT\" -d \"$TARGET_DB\" -Fc --clean < \"$LOCAL_BACKUP\""
+        else
+            "$PG_RESTORE_BIN" -h "$PG_HOST" -U "$PG_USER" -p "$PG_PORT" -d "$TARGET_DB" -Fc --clean "$LOCAL_BACKUP"
+        fi
+    fi
 else
     log "Creating database ${TARGET_DB}"
-    [ "$DRY_RUN" = "1" ] || createdb -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -T template0 "$TARGET_DB"
-    [ "$DRY_RUN" = "1" ] || "$PG_RESTORE_BIN" -h "$PG_HOST" -U "$PG_USER" -p "$PG_PORT" -d "$TARGET_DB" -Fc "$LOCAL_BACKUP"
+    if [ "$DRY_RUN" != "1" ]; then
+        createdb -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -T template0 "$TARGET_DB"
+        if [[ "$PG_RESTORE_BIN" =~ \  ]]; then
+            bash -c "$PG_RESTORE_BIN -h \"$PG_HOST\" -U \"$PG_USER\" -p \"$PG_PORT\" -d \"$TARGET_DB\" -Fc < \"$LOCAL_BACKUP\""
+        else
+            "$PG_RESTORE_BIN" -h "$PG_HOST" -U "$PG_USER" -p "$PG_PORT" -d "$TARGET_DB" -Fc "$LOCAL_BACKUP"
+        fi
+    fi
 fi
 
 [ "$DRY_RUN" = "1" ] || rm -f "$LOCAL_BACKUP"
@@ -245,5 +242,3 @@ if [ "$DRY_RUN" != "1" ] && [ -n "$HEALTHCHECK_CMD" ]; then
     log " * Running healthcheck command"
     bash -c "$HEALTHCHECK_CMD" || fail "Healthcheck command failed"
 fi
-
-
